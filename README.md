@@ -12,6 +12,16 @@
 
 The latent bottleneck means the diffusion model works on a smaller, smoother manifold — improving sample quality and enabling faster inference.
 
+### Research features
+
+TabLDM ships with the techniques that make modern diffusion models work well:
+
+- **Cosine noise schedule** (Nichol & Dhariwal, *Improved DDPM*) — default.
+- **DDIM sampling** (Song et al.) — deterministic generation in 20–50 steps instead of 1000 (≈10× faster).
+- **Classifier-free guidance** (Ho & Salimans) — done correctly with a reserved null token and conditioning dropout during training, so `guidance_scale` genuinely steers class-conditional output.
+- **Min-SNR-γ loss weighting** (Hang et al. 2023) — faster, more stable diffusion convergence.
+- **EMA weights** — sampling from an exponential moving average of the denoiser.
+
 ## Industry Applications
 
 - **Fraud detection**: Oversample rare fraud cases for imbalanced classifiers.
@@ -37,27 +47,45 @@ model.fit(df, target_col="label", vae_epochs=100, diffusion_epochs=300)
 synthetic = model.generate(n_samples=1000)
 ```
 
-### Class-conditional generation
+### Class-conditional generation (with guidance + fast sampling)
 
 ```python
 import numpy as np
 
-# Generate 500 fraud + 500 legit rows
+# Generate 500 fraud + 500 legit rows, steered by classifier-free guidance,
+# using fast 50-step DDIM sampling.
 labels = np.array([0] * 500 + [1] * 500)
-synthetic = model.generate(1000, labels=labels)
+synthetic = model.generate(
+    1000, labels=labels, guidance_scale=2.0, num_inference_steps=50
+)
 ```
 
-### Evaluate fidelity
+### Evaluate fidelity — one call
 
 ```python
-from tabular_ldm.metrics import column_shapes, ml_efficacy, privacy_distance
+from tabular_ldm.metrics import quality_report
 
-shapes   = column_shapes(real_df, synthetic)
-efficacy = ml_efficacy(real_df, synthetic, target_col="label")
-privacy  = privacy_distance(real_df, synthetic)
+report = quality_report(real_df, synthetic, target_col="label")
+print(f"Overall score:   {report['overall_score']:.3f}")   # 0–1, higher better
+print(f"Shape fidelity:  {report['shape_fidelity']:.3f}")
+print(f"TSTR/TRTR ratio: {report['ml_efficacy']['efficacy_ratio']:.3f}")
+print(f"NNDR (privacy):  {report['privacy']['nndr_mean']:.3f}")
+```
 
-print(f"TSTR/TRTR ratio: {efficacy['efficacy_ratio']:.3f}")
-print(f"NNDR (privacy):  {privacy['nndr_mean']:.3f}")
+Individual metrics (`column_shapes`, `column_pair_trends`, `ml_efficacy`, `privacy_distance`) are also available directly.
+
+### Command line
+
+```bash
+# Train and save
+python -m tabular_ldm fit data.csv --target label --out model/
+
+# Generate (DDIM 50 steps, guidance 2.0, class 1)
+python -m tabular_ldm generate model/ --n 1000 --out synth.csv \
+    --label 1 --guidance 2.0 --steps 50
+
+# Score synthetic vs real
+python -m tabular_ldm evaluate data.csv synth.csv --target label
 ```
 
 ### Save & load

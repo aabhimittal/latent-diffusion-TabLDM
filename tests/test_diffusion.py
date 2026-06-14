@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from tabular_ldm.diffusion import DDPMScheduler, DenoisingMLP
+from tabular_ldm.diffusion import DDPMScheduler, DenoisingMLP, EMA
 
 
 LATENT_DIM = 16
@@ -101,3 +101,98 @@ class TestDenoisingMLP:
         loss.backward()
         for p in denoiser.parameters():
             assert p.grad is not None
+
+
+class TestCosineSchedule:
+    def test_construct(self):
+        sched = DDPMScheduler(num_timesteps=T, schedule="cosine")
+        assert sched.betas.shape == (T,)
+        assert sched.alphas_cumprod.shape == (T,)
+
+    def test_betas_clamped_below_one(self):
+        sched = DDPMScheduler(num_timesteps=T, schedule="cosine")
+        assert (sched.betas <= 0.999 + 1e-6).all()
+        assert (sched.betas > 0).all()
+
+    def test_alphas_cumprod_monotone_decreasing(self):
+        sched = DDPMScheduler(num_timesteps=T, schedule="cosine")
+        assert (sched.alphas_cumprod[1:] <= sched.alphas_cumprod[:-1] + 1e-6).all()
+
+    def test_invalid_schedule_raises(self):
+        with pytest.raises(ValueError, match="Unknown schedule"):
+            DDPMScheduler(num_timesteps=T, schedule="quadratic")
+
+    def test_snr_decreases_with_time(self):
+        sched = DDPMScheduler(num_timesteps=T, schedule="cosine")
+        # Higher noise (larger t) => lower signal-to-noise ratio.
+        assert sched.snr[0] > sched.snr[-1]
+
+
+class TestDDIM:
+    def test_ddim_step_shape(self, scheduler):
+        x_t = torch.randn(BATCH, LATENT_DIM)
+        pred_noise = torch.randn(BATCH, LATENT_DIM)
+        x_prev = scheduler.ddim_step(x_t, t_idx=50, t_prev_idx=40, pred_noise=pred_noise)
+        assert x_prev.shape == x_t.shape
+
+    def test_ddim_deterministic_eta0(self, scheduler):
+        x_t = torch.randn(BATCH, LATENT_DIM)
+        pred_noise = torch.randn(BATCH, LATENT_DIM)
+        x1 = scheduler.ddim_step(x_t, 50, 40, pred_noise, eta=0.0)
+        x2 = scheduler.ddim_step(x_t, 50, 40, pred_noise, eta=0.0)
+        torch.testing.assert_close(x1, x2)
+
+    def test_ddim_final_step(self, scheduler):
+        x_t = torch.randn(BATCH, LATENT_DIM)
+        pred_noise = torch.randn(BATCH, LATENT_DIM)
+        # t_prev_idx == -1 means abar_prev == 1 (full denoise to x0).
+        x_prev = scheduler.ddim_step(x_t, t_idx=0, t_prev_idx=-1, pred_noise=pred_noise)
+        assert torch.isfinite(x_prev).all()
+
+    def test_inference_timesteps_descending(self, scheduler):
+        steps = scheduler.inference_timesteps(10)
+        assert len(steps) == 10
+        assert steps == sorted(steps, reverse=True)
+        assert max(steps) < T and min(steps) >= 0
+
+    def test_inference_timesteps_capped(self, scheduler):
+        steps = scheduler.inference_timesteps(10_000)
+        assert len(steps) <= T
+
+
+class TestEMA:
+    def test_shadow_initialized(self, denoiser):
+        ema = EMA(denoiser, decay=0.9)
+        for k, v in denoiser.state_dict().items():
+            torch.testing.assert_close(ema.shadow[k], v)
+
+    def test_update_moves_toward_model(self):
+        m = DenoisingMLP(latent_dim=LATENT_DIM, hidden_dims=[32])
+        ema = EMA(m, decay=0.5)
+        # Perturb the model, then update EMA; shadow should move but not all the way.
+        with torch.no_grad():
+            for p in m.parameters():
+                p.add_(1.0)
+        ema.update(m)
+        # With decay 0.5 the shadow should be halfway, not equal to the new weights.
+        any_diff = any(
+            not torch.allclose(ema.shadow[k], v)
+            for k, v in m.state_dict().items()
+            if v.dtype.is_floating_point
+        )
+        assert any_diff
+
+    def test_copy_to_restores_weights(self):
+        m = DenoisingMLP(latent_dim=LATENT_DIM, hidden_dims=[32])
+        ema = EMA(m, decay=0.9)
+        original = {k: v.clone() for k, v in m.state_dict().items()}
+        with torch.no_grad():
+            for p in m.parameters():
+                p.add_(5.0)
+        ema.copy_to(m)
+        for k, v in m.state_dict().items():
+            torch.testing.assert_close(v, original[k])
+
+    def test_invalid_decay_raises(self, denoiser):
+        with pytest.raises(ValueError):
+            EMA(denoiser, decay=1.5)

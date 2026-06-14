@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.datasets import make_classification
 
 from tabular_ldm import TabularLDM
-from tabular_ldm.metrics import column_shapes, ml_efficacy, privacy_distance
+from tabular_ldm.metrics import quality_report
 
 
 def make_fraud_dataset(n: int = 2000, seed: int = 42) -> pd.DataFrame:
@@ -77,61 +77,58 @@ def main():
     print(f"\n  Training time: {elapsed:.1f}s")
 
     # ------------------------------------------------------------------ #
-    # 3. Generate balanced synthetic data
+    # 3. Fast DDIM sampling vs full DDPM
     # ------------------------------------------------------------------ #
-    print_section("3. Generating 1000 balanced synthetic rows (50/50)")
+    print_section("3. Sampling speed: full DDPM vs DDIM")
     n_gen = 1000
     labels = np.array([0] * (n_gen // 2) + [1] * (n_gen // 2))
-    synth_df = model.generate(n_gen, labels=labels)
-    # Re-attach generated labels
+
+    t0 = time.time()
+    _ = model.generate(n_gen, labels=labels)
+    t_full = time.time() - t0
+
+    t0 = time.time()
+    synth_df = model.generate(n_gen, labels=labels, num_inference_steps=50)
+    t_fast = time.time() - t0
+
+    print(f"\n  Full DDPM ({model.num_timesteps} steps): {t_full:.2f}s")
+    print(f"  DDIM (50 steps):          {t_fast:.2f}s   →  {t_full / t_fast:.1f}x faster")
+
     le = model._label_encoder
     synth_df["label"] = le.inverse_transform(labels)
     print(f"  Generated shape: {synth_df.shape}")
-    print(f"  Columns: {list(synth_df.columns)}")
 
     # ------------------------------------------------------------------ #
-    # 4. Evaluate fidelity
+    # 4. Classifier-free guidance separates the classes
     # ------------------------------------------------------------------ #
-    print_section("4. Column-shape fidelity (real vs synthetic)")
-    feature_cols = [c for c in df.columns if c != "label"]
-    shapes = column_shapes(df[feature_cols], synth_df[feature_cols])
-    num_cols = [c for c, v in shapes.items() if v["type"] == "numerical"]
-    cat_cols = [c for c, v in shapes.items() if v["type"] == "categorical"]
+    print_section("4. Classifier-free guidance (class conditioning)")
+    fraud_rate_real = (df["label"] == "1").mean()
+    for scale in [1.0, 3.0]:
+        fraud = model.generate(
+            500, labels=np.ones(500, int), guidance_scale=scale, num_inference_steps=50
+        )
+        # Compare a representative feature's mean under the "fraud" condition.
+        print(f"  guidance={scale:>3.1f} → mean(feature_0 | fraud) = {fraud['feature_0'].mean():+.3f}")
+    print(f"  (real fraud rate in training data: {fraud_rate_real:.1%})")
 
-    print("\n  Numerical columns (KS statistic, lower is better):")
-    for col in num_cols:
-        ks = shapes[col]["ks_statistic"]
-        bar = "█" * int(ks * 20)
-        print(f"    {col:<20} KS={ks:.3f}  {bar}")
-
-    print("\n  Categorical columns (TV distance, lower is better):")
-    for col in cat_cols:
-        tv = shapes[col]["tv_distance"]
-        bar = "█" * int(tv * 20)
-        print(f"    {col:<20} TV={tv:.3f}  {bar}")
-
-    print_section("5. ML Efficacy (TSTR vs TRTR)")
-    result = ml_efficacy(df, synth_df, target_col="label")
-    print(f"\n  Train-on-Real  Test-on-Real  (TRTR): {result['TRTR']:.3f}")
-    print(f"  Train-on-Synth Test-on-Real  (TSTR): {result['TSTR']:.3f}")
-    ratio = result["efficacy_ratio"]
-    print(f"  Efficacy ratio (TSTR/TRTR):          {ratio:.3f}  ", end="")
-    if ratio >= 0.85:
-        print("✓ Excellent")
-    elif ratio >= 0.70:
-        print("~ Acceptable")
-    else:
-        print("✗ Poor (train longer or tune hyperparameters)")
-
-    print_section("6. Privacy (NNDR)")
-    priv = privacy_distance(df[feature_cols], synth_df[feature_cols], numerical_cols=num_cols)
-    print(f"\n  Nearest-Neighbour Distance Ratio (mean): {priv['nndr_mean']:.3f}")
-    print(f"  Nearest-Neighbour Distance Ratio (median): {priv['nndr_median']:.3f}")
-    print("  (Values ≥ 1.0 indicate low memorisation risk)")
+    # ------------------------------------------------------------------ #
+    # 5. One-call quality scorecard
+    # ------------------------------------------------------------------ #
+    print_section("5. Quality report (single call)")
+    report = quality_report(df, synth_df, target_col="label")
+    print(f"\n  Overall score:        {report['overall_score']:.3f}  (0–1, higher better)")
+    print(f"  Shape fidelity:       {report['shape_fidelity']:.3f}")
+    print(f"  Correlation fidelity: {report['correlation_fidelity']:.3f}")
+    eff = report["ml_efficacy"]
+    print(f"  ML efficacy (TSTR/TRTR): {eff['efficacy_ratio']:.3f}"
+          f"  (TRTR={eff['TRTR']:.3f}, TSTR={eff['TSTR']:.3f})")
+    print(f"  Privacy NNDR (mean):  {report['privacy']['nndr_mean']:.3f}"
+          f"  (≥1.0 ⇒ low memorisation)")
 
     print_section("Done")
-    print("\n  Model can be saved with:  model.save('my_model/')")
-    print("  Reload with:             TabularLDM.load('my_model/')\n")
+    print("\n  Save:  model.save('my_model/')")
+    print("  Load:  TabularLDM.load('my_model/')")
+    print("  CLI:   python -m tabular_ldm fit data.csv --target label --out model/\n")
 
 
 if __name__ == "__main__":

@@ -1,1 +1,1 @@
-# latent-diffusion-
+# latent-diffusion

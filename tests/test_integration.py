@@ -114,3 +114,64 @@ class TestEndToEnd:
         losses = fast_model.fit_vae(X, epochs=5, verbose=False)
         assert len(losses) == 5
         assert all(isinstance(v, float) for v in losses)
+
+    def test_ddim_fast_sampling(self, fast_model):
+        df = make_dataset()
+        fast_model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=5, verbose=False)
+        synth = fast_model.generate(40, num_inference_steps=10)
+        assert len(synth) == 40
+        assert set(synth.columns) == {"age", "income", "region"}
+
+    def test_guidance_runs(self, fast_model):
+        df = make_dataset()
+        fast_model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=5, verbose=False)
+        labels = np.zeros(30, dtype=int)
+        synth = fast_model.generate(30, labels=labels, guidance_scale=2.0)
+        assert len(synth) == 30
+
+    def test_guidance_with_ddim(self, fast_model):
+        df = make_dataset()
+        fast_model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=5, verbose=False)
+        labels = np.ones(25, dtype=int)
+        synth = fast_model.generate(
+            25, labels=labels, guidance_scale=3.0, num_inference_steps=8
+        )
+        assert len(synth) == 25
+
+    def test_cosine_schedule_end_to_end(self):
+        model = TabularLDM(
+            latent_dim=8,
+            vae_hidden_dims=[32],
+            diffusion_hidden_dims=[64],
+            num_timesteps=30,
+            schedule="cosine",
+            device="cpu",
+        )
+        df = make_dataset()
+        model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=4, verbose=False)
+        assert model.scheduler.schedule == "cosine"
+        synth = model.generate(20, num_inference_steps=10)
+        assert len(synth) == 20
+
+    def test_config_survives_save_load(self, fast_model):
+        df = make_dataset()
+        fast_model.fit(df, target_col="label", vae_epochs=2, diffusion_epochs=2, verbose=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fast_model.save(tmpdir)
+            loaded = TabularLDM.load(tmpdir, device="cpu")
+        assert loaded.schedule == fast_model.schedule
+        assert loaded.min_snr_gamma == fast_model.min_snr_gamma
+        assert loaded._target_col == "label"
+
+    def test_min_snr_none_runs(self):
+        model = TabularLDM(
+            latent_dim=6,
+            vae_hidden_dims=[16],
+            diffusion_hidden_dims=[32],
+            num_timesteps=20,
+            min_snr_gamma=None,
+            device="cpu",
+        )
+        df = make_dataset()[["age", "income", "region"]]
+        model.fit(df, vae_epochs=2, diffusion_epochs=3, verbose=False)
+        assert len(model.generate(10)) == 10

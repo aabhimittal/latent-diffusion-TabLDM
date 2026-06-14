@@ -14,6 +14,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..data.preprocessor import TabularPreprocessor
+from ..diffusion.ema import EMA
 from ..diffusion.network import DenoisingMLP
 from ..diffusion.scheduler import DDPMScheduler
 from ..vae.tabular_vae import TabularVAE
@@ -44,6 +45,10 @@ class TabularLDM:
         num_timesteps: int = 1000,
         kl_weight: float = 0.05,
         num_classes: int = 0,
+        schedule: str = "cosine",
+        cfg_dropout: float = 0.1,
+        min_snr_gamma: Optional[float] = 5.0,
+        ema_decay: float = 0.999,
         device: str = "auto",
     ):
         self.latent_dim = latent_dim
@@ -52,6 +57,10 @@ class TabularLDM:
         self.num_timesteps = num_timesteps
         self.kl_weight = kl_weight
         self.num_classes = num_classes
+        self.schedule = schedule
+        self.cfg_dropout = cfg_dropout
+        self.min_snr_gamma = min_snr_gamma
+        self.ema_decay = ema_decay
 
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,6 +72,7 @@ class TabularLDM:
         self.scheduler: Optional[DDPMScheduler] = None
         self.denoiser: Optional[DenoisingMLP] = None
         self._input_dim: int = 0
+        self._target_col: Optional[str] = None
         self._fitted = False
 
     # ------------------------------------------------------------------
@@ -78,7 +88,9 @@ class TabularLDM:
             kl_weight=self.kl_weight,
         ).to(self.device)
 
-        self.scheduler = DDPMScheduler(num_timesteps=self.num_timesteps).to(self.device)
+        self.scheduler = DDPMScheduler(
+            num_timesteps=self.num_timesteps, schedule=self.schedule
+        ).to(self.device)
 
         self.denoiser = DenoisingMLP(
             latent_dim=self.latent_dim,
@@ -144,12 +156,15 @@ class TabularLDM:
 
         tensors = [Z]
         if labels is not None:
-            tensors.append(torch.tensor(labels, dtype=torch.long))
+            # Offset labels by +1 so embedding index 0 stays reserved for the
+            # unconditional ("null") token used by classifier-free guidance.
+            tensors.append(torch.tensor(labels, dtype=torch.long) + 1)
         dataset = TensorDataset(*tensors)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
         optimizer = optim.AdamW(self.denoiser.parameters(), lr=lr, weight_decay=1e-4)
         lr_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        ema = EMA(self.denoiser, decay=self.ema_decay)
 
         losses: List[float] = []
         self.denoiser.train()
@@ -157,19 +172,28 @@ class TabularLDM:
             total = 0.0
             for batch in loader:
                 z0 = batch[0].to(self.device)
-                y = batch[1].to(self.device) if labels is not None else None
+                y = None
+                if labels is not None:
+                    y = batch[1].to(self.device)
+                    # Classifier-free guidance: randomly drop the label to the
+                    # null token so the model learns both conditional and
+                    # unconditional scores (Ho & Salimans, 2022).
+                    if self.cfg_dropout > 0:
+                        drop = torch.rand(y.size(0), device=self.device) < self.cfg_dropout
+                        y = y.masked_fill(drop, 0)
 
                 t = torch.randint(0, self.scheduler.T, (z0.size(0),), device=self.device)
                 noise = torch.randn_like(z0)
                 z_noisy = self.scheduler.q_sample(z0, t, noise)
 
                 pred_noise = self.denoiser(z_noisy, t, y)
-                loss = nn.functional.mse_loss(pred_noise, noise)
+                loss = self._diffusion_loss(pred_noise, noise, t)
 
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.denoiser.parameters(), 1.0)
                 optimizer.step()
+                ema.update(self.denoiser)
                 total += loss.item()
 
             lr_sched.step()
@@ -177,7 +201,29 @@ class TabularLDM:
             losses.append(avg)
             if verbose and (epoch + 1) % max(1, epochs // 10) == 0:
                 print(f"  Diffusion [{epoch+1:>4d}/{epochs}] loss={avg:.5f}")
+
+        # Sample from the smoothed EMA weights, not the last training step.
+        ema.copy_to(self.denoiser)
         return losses
+
+    def _diffusion_loss(
+        self,
+        pred_noise: torch.Tensor,
+        noise: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """ε-prediction MSE, optionally reweighted by Min-SNR-γ.
+
+        Min-SNR (Hang et al., 2023) caps the per-timestep loss weight at γ,
+        preventing low-noise steps from dominating the gradient and speeding
+        up convergence.
+        """
+        per_sample = nn.functional.mse_loss(pred_noise, noise, reduction="none").mean(dim=1)
+        if self.min_snr_gamma is None:
+            return per_sample.mean()
+        snr = self.scheduler.snr[t]
+        weight = torch.clamp(snr, max=self.min_snr_gamma) / snr
+        return (weight * per_sample).mean()
 
     # ------------------------------------------------------------------
     # Public API
@@ -207,6 +253,7 @@ class TabularLDM:
             diffusion_epochs: Training epochs for Stage 2.
         """
         feature_df = df.drop(columns=[target_col]) if target_col else df
+        self._target_col = target_col
         self.preprocessor = TabularPreprocessor(numerical_cols, categorical_cols)
         X = self.preprocessor.fit_transform(feature_df)
 
@@ -249,6 +296,7 @@ class TabularLDM:
         n_samples: int,
         labels: Optional[np.ndarray] = None,
         guidance_scale: float = 1.0,
+        num_inference_steps: Optional[int] = None,
     ) -> pd.DataFrame:
         """Sample n_samples rows from the learned distribution.
 
@@ -258,6 +306,9 @@ class TabularLDM:
                     Length must equal n_samples. Ignored if num_classes == 0.
             guidance_scale: Classifier-free guidance scale (1.0 = no guidance).
                             Values > 1.0 strengthen the class conditioning signal.
+            num_inference_steps: If set, use deterministic DDIM sampling over
+                    this many steps (much faster). If None, run the full
+                    ``num_timesteps`` ancestral DDPM reverse process.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before generate().")
@@ -269,20 +320,33 @@ class TabularLDM:
 
         y: Optional[torch.Tensor] = None
         if labels is not None and self.num_classes > 0:
-            y = torch.tensor(labels, dtype=torch.long, device=self.device)
+            # +1 offset mirrors training; index 0 is the null token.
+            y = torch.tensor(labels, dtype=torch.long, device=self.device) + 1
 
         use_cfg = guidance_scale > 1.0 and y is not None
-        uncond_y = torch.zeros(n_samples, dtype=torch.long, device=self.device) if use_cfg else None
+        uncond_y = (
+            torch.zeros(n_samples, dtype=torch.long, device=self.device) if use_cfg else None
+        )
 
-        for t_idx in reversed(range(self.scheduler.T)):
-            t = torch.full((n_samples,), t_idx, device=self.device, dtype=torch.long)
-            pred_noise = self.denoiser(z, t, y)
-
+        def predict(z_t, t):
+            pred = self.denoiser(z_t, t, y)
             if use_cfg:
-                uncond_noise = self.denoiser(z, t, uncond_y)
-                pred_noise = uncond_noise + guidance_scale * (pred_noise - uncond_noise)
+                uncond = self.denoiser(z_t, t, uncond_y)
+                pred = uncond + guidance_scale * (pred - uncond)
+            return pred
 
-            z = self.scheduler.p_sample_step(z, t_idx, pred_noise)
+        if num_inference_steps is None:
+            # Full ancestral DDPM.
+            for t_idx in reversed(range(self.scheduler.T)):
+                t = torch.full((n_samples,), t_idx, device=self.device, dtype=torch.long)
+                z = self.scheduler.p_sample_step(z, t_idx, predict(z, t))
+        else:
+            # Fast deterministic DDIM over a sparse subsequence.
+            timesteps = self.scheduler.inference_timesteps(num_inference_steps)
+            for i, t_idx in enumerate(timesteps):
+                t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+                t = torch.full((n_samples,), t_idx, device=self.device, dtype=torch.long)
+                z = self.scheduler.ddim_step(z, t_idx, t_prev, predict(z, t))
 
         X_recon = self.vae.decode(z).cpu().numpy()
         return self.preprocessor.inverse_transform(X_recon)
@@ -305,6 +369,11 @@ class TabularLDM:
             "num_timesteps": self.num_timesteps,
             "kl_weight": self.kl_weight,
             "num_classes": self.num_classes,
+            "schedule": self.schedule,
+            "cfg_dropout": self.cfg_dropout,
+            "min_snr_gamma": self.min_snr_gamma,
+            "ema_decay": self.ema_decay,
+            "target_col": self._target_col,
             "input_dim": self._input_dim,
         }
         with open(os.path.join(path, "meta.pkl"), "wb") as f:
@@ -328,10 +397,15 @@ class TabularLDM:
             num_timesteps=meta["num_timesteps"],
             kl_weight=meta["kl_weight"],
             num_classes=meta["num_classes"],
+            schedule=meta.get("schedule", "linear"),
+            cfg_dropout=meta.get("cfg_dropout", 0.1),
+            min_snr_gamma=meta.get("min_snr_gamma", 5.0),
+            ema_decay=meta.get("ema_decay", 0.999),
             device=device,
         )
         model._init_models(meta["input_dim"])
         model.preprocessor = preprocessor
+        model._target_col = meta.get("target_col")
 
         model.vae.load_state_dict(
             torch.load(os.path.join(path, "vae.pt"), map_location=model.device, weights_only=True)

@@ -2,7 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tabular_ldm.metrics import column_shapes, column_pair_trends, ml_efficacy, privacy_distance
+from tabular_ldm.metrics import (
+    column_shapes,
+    column_pair_trends,
+    ml_efficacy,
+    privacy_distance,
+    quality_report,
+)
 
 
 @pytest.fixture
@@ -108,3 +114,56 @@ class TestPrivacyDistance:
         df = pd.DataFrame({"cat": ["a", "b", "c"]})
         result = privacy_distance(df, df, numerical_cols=[])
         assert result == {}
+
+
+class TestQualityReport:
+    def _data(self):
+        rng = np.random.default_rng(3)
+        n = 300
+        real = pd.DataFrame(
+            {
+                "x": rng.normal(0, 1, n),
+                "y": rng.normal(2, 1, n),
+                "label": rng.choice(["a", "b"], n),
+            }
+        )
+        return real
+
+    def test_identical_data_high_score(self):
+        real = self._data()
+        report = quality_report(real, real.copy(), target_col="label")
+        assert report["overall_score"] > 0.8
+        assert 0.0 <= report["overall_score"] <= 1.0
+
+    def test_report_keys(self):
+        real = self._data()
+        report = quality_report(real, real.copy(), target_col="label")
+        for key in [
+            "overall_score",
+            "shape_fidelity",
+            "correlation_fidelity",
+            "column_shapes",
+            "ml_efficacy",
+            "privacy",
+        ]:
+            assert key in report
+
+    def test_without_target(self):
+        real = self._data().drop(columns=["label"])
+        report = quality_report(real, real.copy())
+        assert report["ml_efficacy"] is None
+        assert 0.0 <= report["overall_score"] <= 1.0
+
+    def test_different_data_lower_score(self):
+        real = self._data()
+        rng = np.random.default_rng(123)
+        synth = pd.DataFrame(
+            {
+                "x": rng.normal(10, 1, 300),
+                "y": rng.normal(-10, 1, 300),
+                "label": rng.choice(["a", "b"], 300),
+            }
+        )
+        good = quality_report(real, real.copy(), target_col="label")["overall_score"]
+        bad = quality_report(real, synth, target_col="label")["overall_score"]
+        assert bad < good

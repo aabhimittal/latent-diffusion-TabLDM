@@ -113,6 +113,66 @@ def ml_efficacy(
     }
 
 
+def quality_report(
+    real_df: pd.DataFrame,
+    synth_df: pd.DataFrame,
+    target_col: Optional[str] = None,
+) -> Dict:
+    """One-call evaluation scorecard combining all fidelity/privacy metrics.
+
+    Returns a nested dict with per-metric detail plus a single ``overall_score``
+    in [0, 1] (higher is better), computed as the mean of:
+      - shape fidelity  = 1 - mean(KS for numerical, TV for categorical)
+      - correlation fidelity = 1 - mean absolute correlation delta
+      - ML efficacy ratio (only if ``target_col`` is provided)
+    Privacy (NNDR) is reported but not folded into the score, since it trades
+    off against fidelity and should be inspected separately.
+    """
+    # ML efficacy needs the target in both frames; if it's missing from the
+    # synthetic data we still report fidelity/privacy but skip efficacy.
+    has_target = (
+        target_col is not None
+        and target_col in real_df.columns
+        and target_col in synth_df.columns
+    )
+
+    def _drop_target(df):
+        return df.drop(columns=[target_col]) if target_col and target_col in df.columns else df
+
+    feature_df_real = _drop_target(real_df)
+    feature_df_synth = _drop_target(synth_df)
+
+    shapes = column_shapes(feature_df_real, feature_df_synth)
+    distances = []
+    for v in shapes.values():
+        distances.append(v["ks_statistic"] if v["type"] == "numerical" else v["tv_distance"])
+    shape_fidelity = max(0.0, 1.0 - (float(np.mean(distances)) if distances else 0.0))
+
+    pair = column_pair_trends(feature_df_real, feature_df_synth)
+    corr_fidelity = max(0.0, 1.0 - pair.get("mean_corr_delta", 0.0)) if pair else None
+
+    privacy = privacy_distance(feature_df_real, feature_df_synth)
+
+    components = [shape_fidelity]
+    if corr_fidelity is not None:
+        components.append(corr_fidelity)
+
+    efficacy = None
+    if has_target:
+        efficacy = ml_efficacy(real_df, synth_df, target_col=target_col)
+        components.append(min(1.0, efficacy["efficacy_ratio"]))
+
+    return {
+        "overall_score": round(float(np.mean(components)), 4),
+        "shape_fidelity": round(shape_fidelity, 4),
+        "correlation_fidelity": round(corr_fidelity, 4) if corr_fidelity is not None else None,
+        "column_shapes": shapes,
+        "column_pair_trends": pair,
+        "ml_efficacy": efficacy,
+        "privacy": privacy,
+    }
+
+
 def privacy_distance(
     real_df: pd.DataFrame,
     synth_df: pd.DataFrame,

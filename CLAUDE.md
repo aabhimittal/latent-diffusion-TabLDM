@@ -39,6 +39,7 @@ Two-stage pipeline: `TabularPreprocessor → TabularVAE → DDPMScheduler + Deno
 `tabular_ldm/data/preprocessor.py` — `TabularPreprocessor`
 - Auto-detects numerical vs categorical columns.
 - Numerical: `StandardScaler`. Categorical: label-encode then one-hot.
+- At fit it records each numerical column's observed `(min, max)` range and whether it is integer-valued (`int_cols`). When `enforce_constraints=True` (default), `inverse_transform()` clamps generated values back into range and rounds integer columns, so synthetic rows stay realistic. Guarded with `getattr` defaults so pre-constraint checkpoints still load.
 - `inverse_transform()` reconstructs a DataFrame from float32 vectors.
 - `get_cat_slices()` returns `{col: (start, end)}` for one-hot blocks — used in tests.
 
@@ -54,6 +55,7 @@ Two-stage pipeline: `TabularPreprocessor → TabularVAE → DDPMScheduler + Deno
 - Supports `schedule="linear"` or `schedule="cosine"` (Nichol & Dhariwal). Cosine is the default chosen by `TabularLDM`.
 - Precomputes `snr` (signal-to-noise per step) for Min-SNR loss weighting.
 - `q_sample(x0, t, noise)` — forward process.
+- `get_velocity(x0, noise, t)` / `velocity_to_noise(x_t, t_idx, v)` — v-prediction target and its conversion back to ε, so the reverse steps stay ε-based regardless of the network's prediction target (Salimans & Ho, 2022).
 - `p_sample_step(x_t, t_idx, pred_noise)` — ancestral DDPM reverse step: `mean = (x_t - β/√(1-ᾱ) · ε) / √α`. Adds noise for `t > 0`.
 - `ddim_step(x_t, t_idx, t_prev_idx, pred_noise, eta=0)` — deterministic DDIM reverse step (Song et al.), enabling sampling on a sparse timestep subsequence.
 - `inference_timesteps(n)` — evenly spaced descending subsequence for DDIM.
@@ -70,18 +72,22 @@ Two-stage pipeline: `TabularPreprocessor → TabularVAE → DDPMScheduler + Deno
 ### Orchestration
 
 `tabular_ldm/models/tabular_ldm.py` — `TabularLDM`
-- `fit()`: calls `fit_vae()` then `fit_diffusion()`. Accepts a `target_col` for class-conditional mode.
-- `fit_diffusion()`: encodes the full dataset to latent μ (eval mode, no reparameterization) before training starts. This makes diffusion training deterministic w.r.t. the VAE. Applies CFG label dropout (`cfg_dropout`), Min-SNR-γ loss weighting (`min_snr_gamma`), and EMA.
-- `_diffusion_loss()`: ε-prediction MSE, optionally reweighted by `min(SNR, γ)/SNR` (Min-SNR-γ, Hang et al. 2023). Set `min_snr_gamma=None` for plain MSE.
-- `generate()`: full ancestral DDPM by default; pass `num_inference_steps` for fast DDIM. Classifier-free guidance via `guidance_scale > 1.0`.
-- `save()`/`load()`: pickles preprocessor + meta dict (now includes `schedule`, `cfg_dropout`, `min_snr_gamma`, `ema_decay`, `target_col`); saves model weights as `.pt` files. `load()` uses `meta.get(...)` defaults so older checkpoints still load.
+- `fit()`: calls `fit_vae()` then `fit_diffusion()`. Accepts a `target_col` for class-conditional mode. Seeds all RNGs first if `random_state` was set.
+- `fit_diffusion()`: encodes the full dataset to latent μ (eval mode, no reparameterization) before training starts. This makes diffusion training deterministic w.r.t. the VAE. Applies CFG label dropout (`cfg_dropout`), Min-SNR-γ loss weighting (`min_snr_gamma`), and EMA. The training target is the velocity when `prediction_type="v"`, else the noise.
+- `_diffusion_loss()`: MSE against the target, optionally Min-SNR-γ reweighted (Hang et al. 2023). Weight is `min(SNR,γ)/SNR` for ε-prediction and `min(SNR,γ)/(SNR+1)` for v-prediction. Set `min_snr_gamma=None` for plain MSE.
+- `generate()`: full ancestral DDPM by default; pass `num_inference_steps` for fast DDIM. Classifier-free guidance via `guidance_scale > 1.0`. For v-prediction the network output is converted to ε per step before the reverse update. Pass `seed` for reproducible sampling.
+- `augment()`: class-imbalance helper — generates conditional synthetic rows for each minority class up to the majority count and returns the original data concatenated with them (shuffled). Requires a model fitted with `target_col`.
+- `save()`/`load()`: pickles preprocessor + meta dict (includes `schedule`, `prediction_type`, `cfg_dropout`, `min_snr_gamma`, `ema_decay`, `target_col`); saves model weights as `.pt` files. `load()` uses `meta.get(...)` defaults so older checkpoints still load.
+
+`tabular_ldm/utils.py` — `set_seed(seed)` seeds Python/NumPy/PyTorch. Exposed at package root; also driven by `random_state` (fit) and the `seed` arg (generate/augment).
 
 ### Command-line interface
 
-`tabular_ldm/cli.py` (entry point `python -m tabular_ldm`) — three subcommands:
-- `fit <csv> --target <col> --out <dir>` — train and save.
+`tabular_ldm/cli.py` (entry point `python -m tabular_ldm`) — four subcommands:
+- `fit <csv> --target <col> --out <dir> [--prediction-type v --seed S]` — train and save.
 - `generate <model_dir> --n <N> --out <csv> [--label L --guidance G --steps S]` — sample; `--steps` triggers DDIM.
 - `evaluate <real.csv> <synth.csv> --target <col>` — prints a `quality_report` as JSON.
+- `augment <model_dir> <csv> --target <col> --out <csv> [--guidance G --steps S --seed S]` — balance classes with synthetic rows.
 
 ### Metrics
 
@@ -99,15 +105,18 @@ Two-stage pipeline: `TabularPreprocessor → TabularVAE → DDPMScheduler + Deno
 - **Scheduler lives on the same device as the model** — always call `scheduler.to(device)` inside `_init_models()`.
 - **Label offset for CFG** — `nn.Embedding(num_classes + 1, …)` reserves index 0 as the null token. The orchestrator passes `label + 1` for real classes in both `fit_diffusion` and `generate`, and `0` for the unconditional pass. This is essential: without the offset, class 0 collides with the null token and guidance silently breaks. Training must also *see* the null token, which is why `cfg_dropout > 0` randomly maps labels to 0 during training.
 - **EMA before sampling** — diffusion training ends with `ema.copy_to(denoiser)`; never sample from the raw last-step weights.
-- **Min-SNR weighting is on by default** (`min_snr_gamma=5.0`); set to `None` to disable.
+- **Min-SNR weighting is on by default** (`min_snr_gamma=5.0`); set to `None` to disable. The weight formula differs by `prediction_type` — keep the two branches in `_diffusion_loss()` in sync with the target chosen in `fit_diffusion()`.
+- **Prediction target** defaults to `epsilon`; `prediction_type="v"` switches both the training target (`get_velocity`) and the sampling conversion (`velocity_to_noise`). Reverse steps always operate on ε.
+- **Output constraints** are enforced in `TabularPreprocessor.inverse_transform`, not in the model — the model works entirely in continuous latent/feature space and never sees integer/range constraints.
 
 ## Test layout
 
 | File | What it covers |
 |------|---------------|
-| `test_preprocessor.py` | Roundtrip, shape, one-hot validity, auto-detection |
+| `test_preprocessor.py` | Roundtrip, shape, one-hot validity, auto-detection, output constraints |
 | `test_vae.py` | Forward shapes, loss, reparameterization modes |
-| `test_diffusion.py` | Scheduler math (linear + cosine), DDIM, EMA, denoiser shapes/gradients |
+| `test_diffusion.py` | Scheduler math (linear + cosine), v-prediction, DDIM, EMA, denoiser shapes/gradients |
 | `test_metrics.py` | All metric functions incl. `quality_report` |
-| `test_integration.py` | Full pipeline: fit → generate (DDPM + DDIM + guidance) → save → load |
-| `test_cli.py` | CLI fit → generate → evaluate roundtrip |
+| `test_integration.py` | Full pipeline: fit → generate (DDPM + DDIM + guidance + v-pred) → augment → save → load; reproducibility |
+| `test_cli.py` | CLI fit → generate → evaluate → augment roundtrip |
+| `test_utils.py` | `set_seed` reproducibility |

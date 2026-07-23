@@ -17,6 +17,7 @@ from ..data.preprocessor import TabularPreprocessor
 from ..diffusion.ema import EMA
 from ..diffusion.network import DenoisingMLP
 from ..diffusion.scheduler import DDPMScheduler
+from ..utils import set_seed
 from ..vae.tabular_vae import TabularVAE
 
 
@@ -46,11 +47,15 @@ class TabularLDM:
         kl_weight: float = 0.05,
         num_classes: int = 0,
         schedule: str = "cosine",
+        prediction_type: str = "epsilon",
         cfg_dropout: float = 0.1,
         min_snr_gamma: Optional[float] = 5.0,
         ema_decay: float = 0.999,
+        random_state: Optional[int] = None,
         device: str = "auto",
     ):
+        if prediction_type not in ("epsilon", "v"):
+            raise ValueError("prediction_type must be 'epsilon' or 'v'")
         self.latent_dim = latent_dim
         self.vae_hidden_dims = vae_hidden_dims or [256, 128]
         self.diffusion_hidden_dims = diffusion_hidden_dims or [512, 512, 256, 256]
@@ -58,9 +63,11 @@ class TabularLDM:
         self.kl_weight = kl_weight
         self.num_classes = num_classes
         self.schedule = schedule
+        self.prediction_type = prediction_type
         self.cfg_dropout = cfg_dropout
         self.min_snr_gamma = min_snr_gamma
         self.ema_decay = ema_decay
+        self.random_state = random_state
 
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -186,8 +193,14 @@ class TabularLDM:
                 noise = torch.randn_like(z0)
                 z_noisy = self.scheduler.q_sample(z0, t, noise)
 
-                pred_noise = self.denoiser(z_noisy, t, y)
-                loss = self._diffusion_loss(pred_noise, noise, t)
+                # Target is the velocity for v-prediction, else the noise itself.
+                if self.prediction_type == "v":
+                    target = self.scheduler.get_velocity(z0, noise, t)
+                else:
+                    target = noise
+
+                pred = self.denoiser(z_noisy, t, y)
+                loss = self._diffusion_loss(pred, target, t)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -208,21 +221,26 @@ class TabularLDM:
 
     def _diffusion_loss(
         self,
-        pred_noise: torch.Tensor,
-        noise: torch.Tensor,
+        pred: torch.Tensor,
+        target: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        """ε-prediction MSE, optionally reweighted by Min-SNR-γ.
+        """MSE between prediction and target, optionally reweighted by Min-SNR-γ.
 
         Min-SNR (Hang et al., 2023) caps the per-timestep loss weight at γ,
         preventing low-noise steps from dominating the gradient and speeding
-        up convergence.
+        up convergence. The weight differs by parameterization: min(SNR,γ)/SNR
+        for ε-prediction and min(SNR,γ)/(SNR+1) for v-prediction.
         """
-        per_sample = nn.functional.mse_loss(pred_noise, noise, reduction="none").mean(dim=1)
+        per_sample = nn.functional.mse_loss(pred, target, reduction="none").mean(dim=1)
         if self.min_snr_gamma is None:
             return per_sample.mean()
         snr = self.scheduler.snr[t]
-        weight = torch.clamp(snr, max=self.min_snr_gamma) / snr
+        clamped = torch.clamp(snr, max=self.min_snr_gamma)
+        if self.prediction_type == "v":
+            weight = clamped / (snr + 1.0)
+        else:
+            weight = clamped / snr
         return (weight * per_sample).mean()
 
     # ------------------------------------------------------------------
@@ -252,6 +270,9 @@ class TabularLDM:
             vae_epochs: Training epochs for Stage 1.
             diffusion_epochs: Training epochs for Stage 2.
         """
+        if self.random_state is not None:
+            set_seed(self.random_state)
+
         feature_df = df.drop(columns=[target_col]) if target_col else df
         self._target_col = target_col
         self.preprocessor = TabularPreprocessor(numerical_cols, categorical_cols)
@@ -297,6 +318,7 @@ class TabularLDM:
         labels: Optional[np.ndarray] = None,
         guidance_scale: float = 1.0,
         num_inference_steps: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> pd.DataFrame:
         """Sample n_samples rows from the learned distribution.
 
@@ -309,9 +331,12 @@ class TabularLDM:
             num_inference_steps: If set, use deterministic DDIM sampling over
                     this many steps (much faster). If None, run the full
                     ``num_timesteps`` ancestral DDPM reverse process.
+            seed: If set, seed the RNGs before sampling for reproducible output.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before generate().")
+        if seed is not None:
+            set_seed(seed)
 
         self.vae.eval()
         self.denoiser.eval()
@@ -328,28 +353,99 @@ class TabularLDM:
             torch.zeros(n_samples, dtype=torch.long, device=self.device) if use_cfg else None
         )
 
-        def predict(z_t, t):
-            pred = self.denoiser(z_t, t, y)
+        def predict_noise(z_t, t, t_idx):
+            # Raw network output (CFG-combined); interpret per prediction_type.
+            out = self.denoiser(z_t, t, y)
             if use_cfg:
                 uncond = self.denoiser(z_t, t, uncond_y)
-                pred = uncond + guidance_scale * (pred - uncond)
-            return pred
+                out = uncond + guidance_scale * (out - uncond)
+            if self.prediction_type == "v":
+                return self.scheduler.velocity_to_noise(z_t, t_idx, out)
+            return out
 
         if num_inference_steps is None:
             # Full ancestral DDPM.
             for t_idx in reversed(range(self.scheduler.T)):
                 t = torch.full((n_samples,), t_idx, device=self.device, dtype=torch.long)
-                z = self.scheduler.p_sample_step(z, t_idx, predict(z, t))
+                z = self.scheduler.p_sample_step(z, t_idx, predict_noise(z, t, t_idx))
         else:
             # Fast deterministic DDIM over a sparse subsequence.
             timesteps = self.scheduler.inference_timesteps(num_inference_steps)
             for i, t_idx in enumerate(timesteps):
                 t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
                 t = torch.full((n_samples,), t_idx, device=self.device, dtype=torch.long)
-                z = self.scheduler.ddim_step(z, t_idx, t_prev, predict(z, t))
+                z = self.scheduler.ddim_step(z, t_idx, t_prev, predict_noise(z, t, t_idx))
 
         X_recon = self.vae.decode(z).cpu().numpy()
         return self.preprocessor.inverse_transform(X_recon)
+
+    def augment(
+        self,
+        df: pd.DataFrame,
+        target_col: Optional[str] = None,
+        strategy: str = "balance",
+        guidance_scale: float = 1.0,
+        num_inference_steps: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Balance an imbalanced dataset by appending synthetic minority rows.
+
+        For each class with fewer rows than the majority class, generate enough
+        conditional synthetic rows to match the majority count, then return the
+        original data concatenated with the synthetic rows (shuffled). This is
+        the canonical use case for class-imbalanced problems such as fraud or
+        rare-disease detection.
+
+        Args:
+            df: The real dataset to augment (must contain ``target_col``).
+            target_col: Label column. Defaults to the column used during ``fit``.
+            strategy: Currently only ``"balance"`` (match the majority class).
+            guidance_scale: CFG scale passed to ``generate``.
+            num_inference_steps: DDIM steps passed to ``generate``.
+            seed: Optional seed for reproducible augmentation.
+
+        Returns:
+            A DataFrame with the original rows plus generated minority rows,
+            carrying the same columns as ``df``.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before augment().")
+        if self.num_classes == 0 or not hasattr(self, "_label_encoder"):
+            raise RuntimeError("augment() requires a model fitted with a target_col.")
+        if strategy != "balance":
+            raise ValueError("Only strategy='balance' is currently supported")
+
+        target_col = target_col or self._target_col
+        if target_col is None or target_col not in df.columns:
+            raise ValueError(f"target_col '{target_col}' not found in df")
+
+        if seed is not None:
+            set_seed(seed)
+
+        counts = df[target_col].astype(str).value_counts()
+        majority = int(counts.max())
+
+        synth_frames: List[pd.DataFrame] = []
+        for cls_name, count in counts.items():
+            deficit = majority - int(count)
+            if deficit <= 0:
+                continue
+            cls_idx = int(self._label_encoder.transform([cls_name])[0])
+            gen = self.generate(
+                deficit,
+                labels=np.full(deficit, cls_idx, dtype=int),
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+            )
+            gen[target_col] = cls_name
+            synth_frames.append(gen)
+
+        if not synth_frames:
+            return df.copy()
+
+        combined = pd.concat([df] + synth_frames, ignore_index=True)
+        # Deterministic shuffle honouring the seed set above (if any).
+        return combined.sample(frac=1.0).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -370,6 +466,7 @@ class TabularLDM:
             "kl_weight": self.kl_weight,
             "num_classes": self.num_classes,
             "schedule": self.schedule,
+            "prediction_type": self.prediction_type,
             "cfg_dropout": self.cfg_dropout,
             "min_snr_gamma": self.min_snr_gamma,
             "ema_decay": self.ema_decay,
@@ -398,6 +495,7 @@ class TabularLDM:
             kl_weight=meta["kl_weight"],
             num_classes=meta["num_classes"],
             schedule=meta.get("schedule", "linear"),
+            prediction_type=meta.get("prediction_type", "epsilon"),
             cfg_dropout=meta.get("cfg_dropout", 0.1),
             min_snr_gamma=meta.get("min_snr_gamma", 5.0),
             ema_decay=meta.get("ema_decay", 0.999),

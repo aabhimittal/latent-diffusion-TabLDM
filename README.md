@@ -19,8 +19,15 @@ TabLDM ships with the techniques that make modern diffusion models work well:
 - **Cosine noise schedule** (Nichol & Dhariwal, *Improved DDPM*) — default.
 - **DDIM sampling** (Song et al.) — deterministic generation in 20–50 steps instead of 1000 (≈10× faster).
 - **Classifier-free guidance** (Ho & Salimans) — done correctly with a reserved null token and conditioning dropout during training, so `guidance_scale` genuinely steers class-conditional output.
+- **v-prediction** (Salimans & Ho) — an alternative, more stable training target; enable with `prediction_type="v"`.
 - **Min-SNR-γ loss weighting** (Hang et al. 2023) — faster, more stable diffusion convergence.
 - **EMA weights** — sampling from an exponential moving average of the denoiser.
+
+### Application features
+
+- **`augment()`** — one call to balance imbalanced classes with synthetic minority rows.
+- **Realistic outputs** — integer columns and value ranges are learned and enforced on generated data.
+- **Reproducibility** — `random_state` (training) and `seed` (generation) give bit-for-bit repeatable runs.
 
 ## Industry Applications
 
@@ -60,6 +67,24 @@ synthetic = model.generate(
 )
 ```
 
+### Balance an imbalanced dataset
+
+```python
+# Fraud is 5% of the data? Generate synthetic fraud rows until classes match.
+balanced = model.augment(df, target_col="label", guidance_scale=2.0)
+# balanced now has ~50/50 classes: original rows + synthetic minority rows.
+```
+
+### Reproducible runs
+
+```python
+# Deterministic training and sampling.
+model = TabularLDM(latent_dim=32, random_state=42)
+model.fit(df, target_col="label")
+a = model.generate(1000, seed=7)
+b = model.generate(1000, seed=7)   # identical to `a`
+```
+
 ### Evaluate fidelity — one call
 
 ```python
@@ -86,6 +111,9 @@ python -m tabular_ldm generate model/ --n 1000 --out synth.csv \
 
 # Score synthetic vs real
 python -m tabular_ldm evaluate data.csv synth.csv --target label
+
+# Balance an imbalanced dataset
+python -m tabular_ldm augment model/ data.csv --target label --out balanced.csv --steps 50
 ```
 
 ### Save & load

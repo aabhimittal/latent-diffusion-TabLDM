@@ -95,6 +95,39 @@ class DDPMScheduler:
         s_one_minus = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
         return s_alpha * x0 + s_one_minus * noise
 
+    def get_velocity(
+        self,
+        x0: torch.Tensor,
+        noise: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """v-prediction target v = sqrt(ᾱ_t)·ε − sqrt(1-ᾱ_t)·x0.
+
+        The velocity parameterization (Salimans & Ho, 2022) is numerically
+        better-behaved than ε-prediction near t=0 and pairs well with the
+        cosine schedule.
+        """
+        s_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1)
+        s_one_minus = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
+        return s_alpha * noise - s_one_minus * x0
+
+    def velocity_to_noise(
+        self,
+        x_t: torch.Tensor,
+        t_idx: int,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert a predicted velocity to the equivalent ε at scalar step t_idx.
+
+        ε = sqrt(1-ᾱ_t)·x_t + sqrt(ᾱ_t)·v  (see Salimans & Ho, 2022, Appendix D).
+        This lets the DDPM/DDIM reverse steps stay ε-based regardless of the
+        network's prediction target.
+        """
+        s_alpha = self.sqrt_alphas_cumprod[t_idx]
+        s_one_minus = self.sqrt_one_minus_alphas_cumprod[t_idx]
+        return s_one_minus * x_t + s_alpha * v
+
+
     def p_sample_step(
         self,
         x_t: torch.Tensor,

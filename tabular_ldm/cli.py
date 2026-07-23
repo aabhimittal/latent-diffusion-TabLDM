@@ -34,6 +34,8 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         latent_dim=args.latent_dim,
         num_timesteps=args.timesteps,
         schedule=args.schedule,
+        prediction_type=args.prediction_type,
+        random_state=args.seed,
         device=args.device,
     )
     model.fit(
@@ -81,6 +83,21 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_augment(args: argparse.Namespace) -> int:
+    model = TabularLDM.load(args.model, device=args.device)
+    df = pd.read_csv(args.data)
+    balanced = model.augment(
+        df,
+        target_col=args.target,
+        guidance_scale=args.guidance,
+        num_inference_steps=args.steps,
+        seed=args.seed,
+    )
+    balanced.to_csv(args.out, index=False)
+    print(f"Wrote {len(balanced)} balanced rows to {args.out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tabular_ldm", description="TabLDM CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -92,9 +109,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_fit.add_argument("--latent-dim", type=int, default=32)
     p_fit.add_argument("--timesteps", type=int, default=1000)
     p_fit.add_argument("--schedule", default="cosine", choices=["linear", "cosine"])
+    p_fit.add_argument(
+        "--prediction-type", default="epsilon", choices=["epsilon", "v"],
+        help="Diffusion target: 'epsilon' (noise) or 'v' (velocity)",
+    )
     p_fit.add_argument("--vae-epochs", type=int, default=100)
     p_fit.add_argument("--diffusion-epochs", type=int, default=300)
     p_fit.add_argument("--batch-size", type=int, default=256)
+    p_fit.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     p_fit.add_argument("--device", default="auto")
     p_fit.set_defaults(func=_cmd_fit)
 
@@ -113,6 +135,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("synthetic", help="Path to synthetic CSV")
     p_eval.add_argument("--target", default=None, help="Label column")
     p_eval.set_defaults(func=_cmd_evaluate)
+
+    p_aug = sub.add_parser("augment", help="Balance a CSV's classes with synthetic rows")
+    p_aug.add_argument("model", help="Path to saved model directory")
+    p_aug.add_argument("data", help="Path to CSV to augment")
+    p_aug.add_argument("--target", default=None, help="Label column (defaults to fit target)")
+    p_aug.add_argument("--out", default="augmented.csv", help="Output CSV path")
+    p_aug.add_argument("--guidance", type=float, default=1.0, help="CFG scale")
+    p_aug.add_argument("--steps", type=int, default=None, help="DDIM inference steps")
+    p_aug.add_argument("--seed", type=int, default=None, help="Random seed")
+    p_aug.add_argument("--device", default="auto")
+    p_aug.set_defaults(func=_cmd_augment)
 
     return parser
 

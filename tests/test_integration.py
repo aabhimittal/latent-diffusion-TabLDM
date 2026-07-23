@@ -108,7 +108,6 @@ class TestEndToEnd:
         assert synth.shape == (50, 2)
 
     def test_vae_loss_history_returned(self, fast_model):
-        df = make_dataset()
         fast_model._init_models(5)
         X = np.random.randn(100, 5).astype(np.float32)
         losses = fast_model.fit_vae(X, epochs=5, verbose=False)
@@ -175,3 +174,92 @@ class TestEndToEnd:
         df = make_dataset()[["age", "income", "region"]]
         model.fit(df, vae_epochs=2, diffusion_epochs=3, verbose=False)
         assert len(model.generate(10)) == 10
+
+    def test_v_prediction_end_to_end(self):
+        model = TabularLDM(
+            latent_dim=8,
+            vae_hidden_dims=[32],
+            diffusion_hidden_dims=[64],
+            num_timesteps=30,
+            prediction_type="v",
+            device="cpu",
+        )
+        df = make_dataset()
+        model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=5, verbose=False)
+        # Both DDPM and DDIM paths must run with v-prediction.
+        assert len(model.generate(20)) == 20
+        assert len(model.generate(20, num_inference_steps=10)) == 20
+
+    def test_v_prediction_survives_save_load(self):
+        model = TabularLDM(
+            latent_dim=8,
+            vae_hidden_dims=[32],
+            diffusion_hidden_dims=[64],
+            num_timesteps=20,
+            prediction_type="v",
+            device="cpu",
+        )
+        df = make_dataset()
+        model.fit(df, target_col="label", vae_epochs=2, diffusion_epochs=2, verbose=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save(tmpdir)
+            loaded = TabularLDM.load(tmpdir, device="cpu")
+        assert loaded.prediction_type == "v"
+
+    def test_invalid_prediction_type_raises(self):
+        with pytest.raises(ValueError, match="prediction_type"):
+            TabularLDM(prediction_type="x0", device="cpu")
+
+    def test_reproducible_generation(self, fast_model):
+        df = make_dataset()
+        fast_model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=4, verbose=False)
+        a = fast_model.generate(30, num_inference_steps=10, seed=99)
+        b = fast_model.generate(30, num_inference_steps=10, seed=99)
+        assert a.equals(b)
+
+    def test_random_state_makes_fit_deterministic(self):
+        df = make_dataset()
+
+        def train_and_sample():
+            m = TabularLDM(
+                latent_dim=6,
+                vae_hidden_dims=[16],
+                diffusion_hidden_dims=[32],
+                num_timesteps=20,
+                random_state=7,
+                device="cpu",
+            )
+            m.fit(df[["age", "income", "region"]], vae_epochs=3, diffusion_epochs=3, verbose=False)
+            return m.generate(15, num_inference_steps=8, seed=1)
+
+        assert train_and_sample().equals(train_and_sample())
+
+    def test_augment_balances_classes(self, fast_model):
+        rng = np.random.default_rng(0)
+        n = 300
+        df = pd.DataFrame(
+            {
+                "age": rng.integers(18, 70, n).astype(float),
+                "income": rng.normal(50_000, 8_000, n),
+                "region": rng.choice(["north", "south"], n),
+                "label": ["churn"] * 60 + ["retain"] * 240,
+            }
+        )
+        fast_model.fit(df, target_col="label", vae_epochs=3, diffusion_epochs=4, verbose=False)
+        aug = fast_model.augment(df, num_inference_steps=8, seed=3)
+        counts = aug["label"].value_counts()
+        assert counts["churn"] == counts["retain"] == 240
+        assert list(aug.columns) == list(df.columns)
+
+    def test_augment_requires_conditional_model(self):
+        model = TabularLDM(
+            latent_dim=6,
+            vae_hidden_dims=[16],
+            diffusion_hidden_dims=[32],
+            num_timesteps=20,
+            device="cpu",
+        )
+        df = make_dataset()[["age", "income", "region"]]
+        model.fit(df, vae_epochs=2, diffusion_epochs=2, verbose=False)
+        with pytest.raises(RuntimeError, match="target_col"):
+            model.augment(df.assign(label="x"), target_col="label")

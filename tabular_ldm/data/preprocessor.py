@@ -15,12 +15,16 @@ class TabularPreprocessor:
         self,
         numerical_cols: Optional[List[str]] = None,
         categorical_cols: Optional[List[str]] = None,
+        enforce_constraints: bool = True,
     ):
         self.numerical_cols = numerical_cols
         self.categorical_cols = categorical_cols
+        self.enforce_constraints = enforce_constraints
         self.scalers: Dict[str, StandardScaler] = {}
         self.encoders: Dict[str, LabelEncoder] = {}
         self.cat_dims: Dict[str, int] = {}
+        self.num_ranges: Dict[str, Tuple[float, float]] = {}
+        self.int_cols: List[str] = []
         self.feature_dim: int = 0
         self.fitted = False
 
@@ -34,6 +38,16 @@ class TabularPreprocessor:
             scaler = StandardScaler()
             scaler.fit(df[[col]])
             self.scalers[col] = scaler
+            # Record the observed range and whether the column is integer-valued,
+            # so generated samples can be clamped/rounded back to realistic values.
+            col_vals = df[col].to_numpy(dtype=np.float64)
+            self.num_ranges[col] = (float(np.nanmin(col_vals)), float(np.nanmax(col_vals)))
+            finite = col_vals[np.isfinite(col_vals)]
+            is_int = pd.api.types.is_integer_dtype(df[col]) or (
+                finite.size > 0 and np.allclose(finite, np.round(finite))
+            )
+            if is_int:
+                self.int_cols.append(col)
 
         for col in self.categorical_cols:
             enc = LabelEncoder()
@@ -67,9 +81,19 @@ class TabularPreprocessor:
         idx = 0
         result: Dict[str, np.ndarray] = {}
 
+        # getattr guards keep checkpoints saved before constraints were added loadable.
+        enforce = getattr(self, "enforce_constraints", False)
+        num_ranges = getattr(self, "num_ranges", {})
+        int_cols = getattr(self, "int_cols", [])
+
         for col in self.numerical_cols:
-            val = self.scalers[col].inverse_transform(X[:, idx : idx + 1])
-            result[col] = val.ravel()
+            val = self.scalers[col].inverse_transform(X[:, idx : idx + 1]).ravel()
+            if enforce and col in num_ranges:
+                lo, hi = num_ranges[col]
+                val = np.clip(val, lo, hi)
+            if enforce and col in int_cols:
+                val = np.rint(val).astype(np.int64)
+            result[col] = val
             idx += 1
 
         for col in self.categorical_cols:

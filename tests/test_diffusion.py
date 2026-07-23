@@ -128,6 +128,27 @@ class TestCosineSchedule:
         assert sched.snr[0] > sched.snr[-1]
 
 
+class TestVPrediction:
+    def test_velocity_shape(self, scheduler):
+        x0 = torch.randn(BATCH, LATENT_DIM)
+        noise = torch.randn(BATCH, LATENT_DIM)
+        t = torch.randint(0, T, (BATCH,))
+        v = scheduler.get_velocity(x0, noise, t)
+        assert v.shape == x0.shape
+
+    def test_velocity_noise_roundtrip(self, scheduler):
+        # Given x_t built from (x0, noise) and the velocity, velocity_to_noise
+        # must recover the original noise exactly (up to float error).
+        x0 = torch.randn(4, LATENT_DIM)
+        noise = torch.randn(4, LATENT_DIM)
+        t_idx = 37
+        t = torch.full((4,), t_idx, dtype=torch.long)
+        x_t = scheduler.q_sample(x0, t, noise)
+        v = scheduler.get_velocity(x0, noise, t)
+        recovered = scheduler.velocity_to_noise(x_t, t_idx, v)
+        torch.testing.assert_close(recovered, noise, atol=1e-4, rtol=1e-4)
+
+
 class TestDDIM:
     def test_ddim_step_shape(self, scheduler):
         x_t = torch.randn(BATCH, LATENT_DIM)

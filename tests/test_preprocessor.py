@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import pytest
 
 from tabular_ldm.data import TabularPreprocessor
 
@@ -80,3 +79,47 @@ class TestTabularPreprocessor:
         X = pp.fit_transform(numerical_df)
         assert X.shape == (150, 3)
         assert pp.categorical_cols == []
+
+
+class TestConstraints:
+    def test_integer_column_detected(self, mixed_df):
+        pp = TabularPreprocessor()
+        pp.fit(mixed_df)
+        # 'age' is integer-valued (stored as float), income/score are continuous.
+        assert "age" in pp.int_cols
+        assert "income" not in pp.int_cols
+
+    def test_ranges_recorded(self, mixed_df):
+        pp = TabularPreprocessor()
+        pp.fit(mixed_df)
+        lo, hi = pp.num_ranges["age"]
+        assert lo == mixed_df["age"].min()
+        assert hi == mixed_df["age"].max()
+
+    def test_integer_column_rounded_on_inverse(self):
+        df = pd.DataFrame({"count": [1.0, 2.0, 3.0, 4.0, 5.0] * 10})
+        pp = TabularPreprocessor()
+        pp.fit(df)
+        # Feed a non-integer standardized value; inverse must round it.
+        X = pp.transform(df)
+        X[:, 0] += 0.13  # perturb within-range
+        out = pp.inverse_transform(X)
+        assert np.issubdtype(out["count"].dtype, np.integer)
+
+    def test_values_clamped_to_range(self):
+        df = pd.DataFrame({"x": np.linspace(0.0, 10.0, 50)})
+        pp = TabularPreprocessor()
+        X = pp.fit_transform(df)
+        # Push some encoded values far outside the trained range.
+        X[:, 0] += 100.0
+        out = pp.inverse_transform(X)
+        assert out["x"].max() <= 10.0 + 1e-6
+        assert out["x"].min() >= 0.0 - 1e-6
+
+    def test_constraints_can_be_disabled(self):
+        df = pd.DataFrame({"x": np.linspace(0.0, 10.0, 50)})
+        pp = TabularPreprocessor(enforce_constraints=False)
+        X = pp.fit_transform(df)
+        X[:, 0] += 100.0
+        out = pp.inverse_transform(X)
+        assert out["x"].max() > 10.0  # not clamped

@@ -62,6 +62,38 @@ class TestCLI:
         assert len(synth) == 30
         assert "label" in synth.columns
 
+    def test_augment(self, csv_dataset, tmp_path):
+        model_dir = str(tmp_path / "model")
+        main(
+            [
+                "fit", csv_dataset,
+                "--target", "label",
+                "--out", model_dir,
+                "--latent-dim", "8",
+                "--timesteps", "20",
+                "--vae-epochs", "3",
+                "--diffusion-epochs", "3",
+                "--seed", "1",
+                "--device", "cpu",
+            ]
+        )
+        out_csv = str(tmp_path / "balanced.csv")
+        rc = main(
+            [
+                "augment", model_dir, csv_dataset,
+                "--target", "label",
+                "--out", out_csv,
+                "--steps", "8",
+                "--seed", "2",
+                "--device", "cpu",
+            ]
+        )
+        assert rc == 0
+        balanced = pd.read_csv(out_csv)
+        counts = balanced["label"].value_counts()
+        # Both classes end up equal after balancing.
+        assert counts.iloc[0] == counts.iloc[-1]
+
     def test_evaluate(self, csv_dataset, tmp_path, capsys):
         # Generate a trivial "synthetic" copy and evaluate it.
         df = pd.read_csv(csv_dataset)
